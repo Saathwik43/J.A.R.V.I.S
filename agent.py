@@ -175,17 +175,28 @@ async def entrypoint(ctx: agents.JobContext):
         else RoomInputOptions(video_enabled=True)
     )
 
-    mcp_server= MCPServerSse(
-        params={"url": os.environ.get("N8N_MCP_SERVER_URL")},
-        cache_tools_list=True,
-        name="SSE MCP SERVER",
-    )
+    mcp_server_url = os.environ.get("N8N_MCP_SERVER_URL")
+    mcp_servers = []
+    if mcp_server_url:
+        mcp_servers.append(
+            MCPServerSse(
+                params={"url": mcp_server_url},
+                cache_tools_list=True,
+                name="SSE MCP SERVER",
+            )
+        )
+    else:
+        logging.warning("N8N_MCP_SERVER_URL is not configured; starting without MCP tools.")
 
     agent = await MCPToolsIntegration.create_agent_with_tools(
-        agent_class=Assistant, agent_kwargs={"chat_ctx": initial_ctx}, 
-        mcp_server=[mcp_server])
+        agent_class=Assistant,
+        agent_kwargs={"chat_ctx": initial_ctx},
+        mcp_servers=mcp_servers,
+    )
 
+    logging.info("Connecting to LiveKit room.")
     await ctx.connect()
+    logging.info("LiveKit room connected; starting agent session.")
 
     await session.start(
         room=ctx.room,
