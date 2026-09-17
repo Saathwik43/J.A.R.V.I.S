@@ -1,20 +1,30 @@
-import logging
+"""Custom function tools for J.A.R.V.I.S: weather, web search, email, memory debug."""
+
 import asyncio
-import time
-from livekit.agents import function_tool, RunContext
-import requests
-from langchain_community.tools import DuckDuckGoSearchRun
-import os
+import logging
+import re
 import smtplib
-from email.mime.multipart import MIMEMultipart  
+import time
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Optional
+from email.utils import parseaddr
+
+import requests
+from ddgs import DDGS
+from livekit.agents import RunContext, function_tool
 from mem0 import AsyncMemoryClient
 
-HTTP_TIMEOUT_SECONDS = 6
-_WEATHER_SESSION = requests.Session()
-_SEARCH_TOOL = DuckDuckGoSearchRun()
+from config import settings
 
+logger = logging.getLogger("jarvis.tools")
+
+HTTP_TIMEOUT_SECONDS = 6
+SMTP_TIMEOUT_SECONDS = 15
+_WEATHER_SESSION = requests.Session()
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+# --- Weather ---------------------------------------------------------------
 
 def _get_weather_sync(city: str) -> str:
     response = _WEATHER_SESSION.get(
@@ -26,13 +36,11 @@ def _get_weather_sync(city: str) -> str:
     raise requests.RequestException(f"Weather API returned {response.status_code}")
 
 
-def _search_web_sync(query: str) -> str:
-    return _SEARCH_TOOL.run(tool_input=query)
-
 @function_tool()
 async def get_weather(
     context: RunContext,  # type: ignore
-    city: str) -> str:
+    city: str,
+) -> str:
     """
     Get the current weather for a given city.
     """
@@ -43,28 +51,39 @@ async def get_weather(
     start = time.perf_counter()
     try:
         result = await asyncio.to_thread(_get_weather_sync, city)
-        logging.info(
-            "Weather for %s returned in %.2fs",
-            city,
-            time.perf_counter() - start,
-        )
+        logger.info("Weather for %s returned in %.2fs", city, time.perf_counter() - start)
         return result
     except requests.Timeout:
-        logging.error(f"Weather request timed out for {city}")
+        logger.error("Weather request timed out for %s", city)
         return f"Weather service timed out for {city}. Please try again."
     except requests.RequestException as e:
-        logging.error(f"Weather request error for {city}: {e}")
+        logger.error("Weather request error for %s: %s", city, e)
         return f"Could not retrieve weather for {city}."
     except Exception as e:
-        logging.error(f"Error retrieving weather for {city}: {e}")
-        return f"An error occurred while retrieving weather for {city}." 
+        logger.error("Error retrieving weather for %s: %s", city, e)
+        return f"An error occurred while retrieving weather for {city}."
+
+
+# --- Web search ------------------------------------------------------------
+
+def _search_web_sync(query: str) -> str:
+    results = DDGS().text(query, max_results=5)
+    lines = []
+    for r in results:
+        title = (r.get("title") or "").strip()
+        body = (r.get("body") or "").strip()
+        href = (r.get("href") or "").strip()
+        lines.append(f"- {title}: {body} ({href})")
+    return "\n".join(lines)
+
 
 @function_tool()
 async def search_web(
     context: RunContext,  # type: ignore
-    query: str) -> str:
+    query: str,
+) -> str:
     """
-    Search the web using DuckDuckGo.
+    Search the web using DuckDuckGo and return the top results.
     """
     query = query.strip()
     if not query:
@@ -73,98 +92,120 @@ async def search_web(
     start = time.perf_counter()
     try:
         results = await asyncio.to_thread(_search_web_sync, query)
-        if not results or not str(results).strip():
+        if not results.strip():
             return f"No search results found for '{query}'."
-        logging.info(
-            "Search for '%s' returned in %.2fs",
-            query,
-            time.perf_counter() - start,
-        )
+        logger.info("Search for '%s' returned in %.2fs", query, time.perf_counter() - start)
         return results
     except Exception as e:
-        logging.error(f"Error searching the web for '{query}': {e}")
-        return f"An error occurred while searching the web for '{query}'."    
+        logger.error("Error searching the web for '%s': %s", query, e)
+        return f"An error occurred while searching the web for '{query}'."
 
-@function_tool()    
+
+# --- Email -----------------------------------------------------------------
+
+def _clean_header(value: str) -> str:
+    """Strip CR/LF to prevent SMTP header injection from model-generated text."""
+    return value.replace("\r", " ").replace("\n", " ").strip()
+
+
+def _valid_email(address: str) -> bool:
+    _, addr = parseaddr(address)
+    return bool(_EMAIL_RE.match(addr))
+
+
+def _send_email_sync(
+    gmail_user: str,
+    gmail_password: str,
+    to_email: str,
+    subject: str,
+    message: str,
+    cc_email: str | None,
+) -> None:
+    msg = MIMEMultipart()
+    msg["From"] = gmail_user
+    msg["To"] = to_email
+    msg["Subject"] = subject
+
+    recipients = [to_email]
+    if cc_email:
+        msg["Cc"] = cc_email
+        recipients.append(cc_email)
+
+    msg.attach(MIMEText(message, "plain"))
+
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=SMTP_TIMEOUT_SECONDS) as server:
+        server.starttls()
+        server.login(gmail_user, gmail_password)
+        server.sendmail(gmail_user, recipients, msg.as_string())
+
+
+@function_tool()
 async def send_email(
     context: RunContext,  # type: ignore
     to_email: str,
     subject: str,
     message: str,
-    cc_email: Optional[str] = None
+    cc_email: str | None = None,
 ) -> str:
     """
-    Send an email through Gmail.
-    
+    Send an email through Gmail. Only call this after the user has verbally
+    confirmed the recipient address and subject.
+
     Args:
         to_email: Recipient email address
         subject: Email subject line
         message: Email body content
         cc_email: Optional CC email address
     """
+    if not settings.gmail_user or not settings.gmail_app_password:
+        logger.error("Gmail credentials not found in environment variables")
+        return "Email sending failed: Gmail credentials not configured."
+
+    to_email = _clean_header(to_email)
+    subject = _clean_header(subject)
+    cc_email = _clean_header(cc_email) if cc_email else None
+
+    if not _valid_email(to_email):
+        return f"Email sending failed: '{to_email}' is not a valid email address."
+    if cc_email and not _valid_email(cc_email):
+        return f"Email sending failed: CC address '{cc_email}' is not a valid email address."
+
     try:
-        # Gmail SMTP configuration
-        smtp_server = "smtp.gmail.com"
-        smtp_port = 587
-        
-        # Get credentials from environment variables
-        gmail_user = os.getenv("GMAIL_USER")
-        gmail_password = os.getenv("GMAIL_APP_PASSWORD")  # Use App Password, not regular password
-        
-        if not gmail_user or not gmail_password:
-            logging.error("Gmail credentials not found in environment variables")
-            return "Email sending failed: Gmail credentials not configured."
-        
-        # Create message
-        msg = MIMEMultipart()
-        msg['From'] = gmail_user
-        msg['To'] = to_email
-        msg['Subject'] = subject
-        
-        # Add CC if provided
-        recipients = [to_email]
-        if cc_email:
-            msg['Cc'] = cc_email
-            recipients.append(cc_email)
-        
-        # Attach message body
-        msg.attach(MIMEText(message, 'plain'))
-        
-        # Connect to Gmail SMTP server
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()  # Enable TLS encryption
-        server.login(gmail_user, gmail_password)
-        
-        # Send email
-        text = msg.as_string()
-        server.sendmail(gmail_user, recipients, text)
-        server.quit()
-        
-        logging.info(f"Email sent successfully to {to_email}")
+        await asyncio.to_thread(
+            _send_email_sync,
+            settings.gmail_user,
+            settings.gmail_app_password,
+            to_email,
+            subject,
+            message,
+            cc_email,
+        )
+        logger.info("Email sent successfully to %s", to_email)
         return f"Email sent successfully to {to_email}"
-        
     except smtplib.SMTPAuthenticationError:
-        logging.error("Gmail authentication failed")
+        logger.error("Gmail authentication failed")
         return "Email sending failed: Authentication error. Please check your Gmail credentials."
     except smtplib.SMTPException as e:
-        logging.error(f"SMTP error occurred: {e}")
-        return f"Email sending failed: SMTP error - {str(e)}"
+        logger.error("SMTP error occurred: %s", e)
+        return f"Email sending failed: SMTP error - {e}"
     except Exception as e:
-        logging.error(f"Error sending email: {e}")
-        return f"An error occurred while sending email: {str(e)}"
+        logger.error("Error sending email: %s", e)
+        return f"An error occurred while sending email: {e}"
 
+
+# --- Memory diagnostics ----------------------------------------------------
 
 @function_tool()
 async def debug_memory_sync(
     context: RunContext,  # type: ignore
-    contains_text: Optional[str] = None,
+    contains_text: str | None = None,
     max_wait_seconds: int = 10,
     poll_interval_seconds: int = 2,
 ) -> str:
     """
     Poll Mem0 for recently stored memories and report visibility.
     """
-    user_id = os.getenv("MEM0_USER_ID", "Saathwik")
+    user_id = settings.mem0_user_id
     max_wait_seconds = max(2, min(max_wait_seconds, 30))
     poll_interval_seconds = max(1, min(poll_interval_seconds, 5))
     deadline = time.monotonic() + max_wait_seconds
@@ -173,7 +214,7 @@ async def debug_memory_sync(
     try:
         mem0 = AsyncMemoryClient()
     except Exception as e:
-        logging.error("Mem0 debug failed to initialize client: %s", e)
+        logger.error("Mem0 debug failed to initialize client: %s", e)
         return f"Mem0 debug failed: could not initialize client ({e})."
 
     attempts = 0
@@ -197,7 +238,7 @@ async def debug_memory_sync(
             else:
                 break
         except Exception as e:
-            logging.warning("Mem0 debug poll error on attempt %d: %s", attempts, e)
+            logger.warning("Mem0 debug poll error on attempt %d: %s", attempts, e)
 
         await asyncio.sleep(poll_interval_seconds)
 
