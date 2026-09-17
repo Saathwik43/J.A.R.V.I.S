@@ -11,6 +11,9 @@ venv.bak/
 keys.txt
 KMS/
 
+.claude/
+.cursor/
+
 # Python
 __pycache__/
 *.py[cod]
